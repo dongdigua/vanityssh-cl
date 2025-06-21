@@ -55,7 +55,7 @@ kernel void generate_seeds(
 "#;
 
 const KERNEL_NAME: &str = "generate_seeds";
-const BATCH_SIZE: usize = 16384;
+const BATCH_SIZE: usize = 65536;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
 #[repr(usize)]
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
                 .set_arg(&out)
                 .set_arg(&start_index)
                 .set_arg(&prngs)
-                .set_global_work_size(ARRAY_SIZE)
+                .set_global_work_size(BATCH_SIZE)
                 .enqueue_nd_range(&queue)?
         };
 
