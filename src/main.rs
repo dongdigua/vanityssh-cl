@@ -6,18 +6,20 @@ use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
 use opencl3::program::Program;
 use opencl3::types::*;
+use rayon::prelude::*;
 
 use rand::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::SECRET_KEY_LENGTH;
-use base64::prelude::*;
-use sha2::{Sha256, Digest};
 use regex::Regex;
 
-use rayon::prelude::*;
+use ssh_key::PrivateKey;
+use ssh_key::private::Ed25519Keypair;
+use ssh_key::public::PublicKey;
+use ssh_key::public::Ed25519PublicKey;
 
 use std::ptr;
-use std::io::Write;
+use std::cmp;
 
 // PRNG by DeepSeek
 const PROGRAM_SOURCE: &str = r#"
@@ -50,10 +52,10 @@ kernel void generate_seeds(
 "#;
 
 const KERNEL_NAME: &str = "generate_seeds";
-const BATCH_SIZE: usize = 4096;
+const BATCH_SIZE: usize = 16384;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
-fn main() -> Result<()> {
+fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
     // Find a usable device for this application
     let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU)?
         .first()
@@ -72,24 +74,45 @@ fn main() -> Result<()> {
         .expect("Program::create_and_build_from_source failed");
     let kernel = Kernel::create(&program, KERNEL_NAME).expect("Kernel::create failed");
 
+    Ok((context, queue, kernel))
+}
 
+fn parse_args() -> Option<Regex> {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.len().cmp(&1) {
+        cmp::Ordering::Equal => {
+            Some(Regex::new(r"test").unwrap(), )
+        }
+        cmp::Ordering::Greater => {
+            Some(Regex::new(args[1].as_str()).unwrap())
+        }
+        cmp::Ordering::Less => {
+            None
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let re = parse_args().unwrap();
+    let (context, queue, kernel) = init_cl()?;
+    println!("opencl initialized");
+
+    // feed data
     let mut rng = rand::rng();
     let prng_constants: [cl_ulong; 4] = [rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>()];
 
-    // Create OpenCL device buffers
     let out = unsafe {
         Buffer::<cl_uchar>::create(&context, CL_MEM_WRITE_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
     let mut prngs = unsafe {
         Buffer::<cl_ulong>::create(&context, CL_MEM_READ_ONLY, 4, ptr::null_mut())?
     };
-
     let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
 
 
     let mut start_index = 0u64;
     let mut tries = 0;
-    let re = Regex::new(r"(?i)shenj").unwrap();
     let now = std::time::Instant::now();
     loop {
         let kernel_event = unsafe {
@@ -106,7 +129,6 @@ fn main() -> Result<()> {
 
         // Create a results array to hold the results from the OpenCL device
         // and enqueue a read command to read the device buffer into the array
-        // after the kernel event completes.
         let mut results: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
         let read_event =
             unsafe { queue.enqueue_read_buffer(&out, CL_NON_BLOCKING, 0, &mut results, &events)? };
@@ -124,8 +146,13 @@ fn main() -> Result<()> {
         tries += 1
     }
 
-    println!("ms: {}", now.elapsed().as_millis());
+    let elapsed = match now.elapsed().as_secs() {
+        0 => 1,
+        n => n,
+    };
+    println!("secs: {}", elapsed);
     println!("tries: {}", tries * BATCH_SIZE);
+    println!("Key/s: {}", tries * BATCH_SIZE / elapsed as usize);
 
     Ok(())
 }
@@ -135,7 +162,7 @@ fn process_key(sk: &SigningKey, re: Regex) -> bool {
     if re.is_match(&fp) {
         println!("{}", pk);
         println!("{}", fp);
-        println!("{:?}", sk);
+        println!("{}", to_ssh_ed25519_private_key(sk));
         true
     } else {
         false
@@ -143,26 +170,18 @@ fn process_key(sk: &SigningKey, re: Regex) -> bool {
 }
 
 fn to_ssh_ed25519_public_key(public_key: &[u8; 32]) -> (String, String) {
-    const KEY_TYPE: &[u8] = b"ssh-ed25519";
-    
-    // Calculate total length: key_type (4 + 11) + public_key (4 + 32)
-    let mut buf = Vec::with_capacity(4 + KEY_TYPE.len() + 4 + public_key.len());
-    
-    // Write key type string and its length
-    buf.write_all(&(KEY_TYPE.len() as u32).to_be_bytes()).unwrap();
-    buf.write_all(KEY_TYPE).unwrap();
-    
-    // Write public key and its length
-    buf.write_all(&(public_key.len() as u32).to_be_bytes()).unwrap();
-    buf.write_all(public_key).unwrap();
+    let pk = PublicKey::from(Ed25519PublicKey(*public_key));
+    (pk.to_openssh().unwrap(), pk.fingerprint(Default::default()).to_string())
+}
 
-    let hash = Sha256::digest(&buf);
+fn to_ssh_ed25519_private_key(sk: &SigningKey) -> String {
+    let private = sk;                         // [u8;32]
+    let public = sk.verifying_key();         // [u8;32]
 
-    let fingerprint = format!("SHA256:{}", BASE64_STANDARD.encode(hash));
-    
-    // Base64 encode and format
-    let encoded = BASE64_STANDARD.encode(&buf);
-    let public_key = format!("ssh-ed25519 {}", encoded);
+    // 2) build an Ed25519 keypair
+    let ed_kp = Ed25519Keypair { public: public.into(), private: private.into() };
 
-    (public_key, fingerprint)
+    // 3) wrap in a PrivateKey and serialize as OpenSSH
+    let pkey = PrivateKey::from(ed_kp);
+    pkey.to_openssh(ssh_key::LineEnding::default()).unwrap().to_string()
 }
