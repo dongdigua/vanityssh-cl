@@ -37,6 +37,10 @@ enum Mode {
 static mut MODE_IDX: Mode = Mode::FingerPrint;
 static RUN: AtomicBool = AtomicBool::new(true);
 
+extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
+    RUN.store(false, Ordering::Relaxed);
+}
+
 // https://github.com/kenba/opencl3/blob/main/examples/basic.rs
 fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
     // Find a usable device for this application
@@ -56,28 +60,52 @@ fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
         .expect("CommandQueue::create_default failed");
 
     // Build the OpenCL program source and create the kernel.
-    let sources = [
-        // include_str!("opencl/blake2b.cl"),
-        // include_str!("opencl/curve25519-constants.cl"),
-        // include_str!("opencl/curve25519-constants2.cl"),
-        // include_str!("opencl/curve25519.cl"),
-        // include_str!("opencl/entry.cl")
-        include_str!("opencl/merged")
-    ];
+    let source = concat!(
+        include_str!("opencl/types.cl"),
+        include_str!("opencl/sha512.cl"),
+        include_str!("opencl/sha_bindings.cl"),
+        include_str!("opencl/curve25519-constants.cl"),
+        include_str!("opencl/curve25519-constants2.cl"),
+        include_str!("opencl/curve25519.cl"),
+        include_str!("opencl/entry.cl")
+    );
 
-    let program = Program::create_and_build_from_sources(&context, &sources, "")
+    let program = Program::create_and_build_from_source(&context, &source, "")
         .expect("Program::create_and_build_from_source failed");
 
-    println!("aaa");
-
     let kernel = Kernel::create(&program, KERNEL_NAME).expect("Kernel::create failed");
-
 
     Ok((context, queue, kernel))
 }
 
+fn parse_args() -> Option<Regex> {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.len().cmp(&1) {
+        cmp::Ordering::Equal => {
+            Some(Regex::new(r"test").unwrap())
+        }
+        cmp::Ordering::Greater => {
+            if args.len() == 3 {
+                match args[2].as_str() {
+                    "-k" => unsafe {MODE_IDX = Mode::PubKey},
+                    _ => todo!("I don't know what you mean"),
+                }
+            }
+            Some(Regex::new(args[1].as_str()).unwrap())
+        }
+        cmp::Ordering::Less => {
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    let re = parse_args().unwrap();
     let mut rng = rand::rng();
+    let handler = SigHandler::Handler(handle_sigint);
+    unsafe { signal::signal(Signal::SIGINT, handler) }.unwrap();
+
     let (context, queue, kernel) = init_cl()?;
     println!("opencl initialized");
 
@@ -91,7 +119,7 @@ fn main() -> Result<()> {
     // let mut start_index = 0u64;
     let mut tries = 0;
     let now = std::time::Instant::now();
-    loop {
+    while RUN.load(Ordering::Relaxed)  {
 
         let mut prng_constants = [0u8; ARRAY_SIZE];
         rng.fill(&mut prng_constants[..]);
@@ -130,11 +158,11 @@ fn main() -> Result<()> {
         // println!("{:?}", results1);
 
         let found = results1.par_chunks_exact(SECRET_KEY_LENGTH)
-            .position(|pk| find_key(pk));
+            .position_any(|pk| find_key(pk, &re));
 
         if let Some(pos) = found {
-            let sk = results0[pos];
-            println!("{:?}", sk);
+            let sk_bytes = results0.chunks_exact(SECRET_KEY_LENGTH).nth(pos).unwrap();
+            to_ssh_ed25519_private_key(sk_bytes.try_into().unwrap());
             break;
         }
 
@@ -153,8 +181,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn find_key(pk_bytes: &[u8]) -> bool {
-    let re = Regex::new("(?i)rick").unwrap();
+fn find_key(pk_bytes: &[u8], re: &Regex) -> bool {
     let pk: PublicKey = Ed25519PublicKey::try_from(pk_bytes).unwrap().into();
     let fp = pk.fingerprint(Default::default()).to_string();
     if re.is_match(&fp) {
@@ -166,35 +193,14 @@ fn find_key(pk_bytes: &[u8]) -> bool {
     }
 }
 
-fn process_key(sk: &SigningKey, re: Regex) -> bool {
-    let v = to_ssh_ed25519_public_key(sk.verifying_key().as_bytes());
-    let to_match = unsafe {&v[MODE_IDX as usize]}.as_ref().unwrap();
-    if re.is_match(&to_match) {
-        println!("{}", &to_match);
-        if unsafe{MODE_IDX == Mode::FingerPrint} {
-            println!("{}", &v[Mode::PubKey as usize].as_ref().unwrap());
-        }
-        println!("{}", to_ssh_ed25519_private_key(sk));
-        true
-    } else {
-        false
-    }
-}
-
-fn to_ssh_ed25519_public_key(public_key: &[u8; 32]) -> [Option<String>; 2] {
-    let pk = PublicKey::from(Ed25519PublicKey(*public_key));
-    [Some(pk.to_openssh().unwrap()),
-     if unsafe{MODE_IDX == Mode::FingerPrint} {
-         Some(pk.fingerprint(Default::default()).to_string())
-     } else {None}]
-}
-
-fn to_ssh_ed25519_private_key(sk: &SigningKey) -> String {
-    let private = sk;
-    let public = sk.verifying_key();
+fn to_ssh_ed25519_private_key(sk_bytes: &[u8; 32]) -> () {
+    let sk = SigningKey::from_bytes(sk_bytes);
+    let private = &sk;
+    let public = &sk.verifying_key();
 
     let ed_kp = Ed25519Keypair { public: public.into(), private: private.into() };
     let pkey = PrivateKey::from(ed_kp);
 
-    pkey.to_openssh(ssh_key::LineEnding::default()).unwrap().to_string()
+    let s = pkey.to_openssh(ssh_key::LineEnding::default()).unwrap().to_string();
+    println!("{}", s);
 }

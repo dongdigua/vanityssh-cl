@@ -12,23 +12,19 @@ __kernel void generate_ed25519_key(
     }
     *((size_t *)key) += thread; // Thread-specific seed modification
 
-    // 2. Derive private key from seed (BLAKE2b hash)
-    blake2b_state keystate;
-    blake2b_init(&keystate, 32); // Output 32-byte hash
-    blake2b_update(&keystate, key, 32);
-    uint32_t idx = 0;
-    blake2b_update(&keystate, (uchar *)&idx, 4); // Append 0
-    blake2b_final(&keystate, key, 32); // 'key' is now private key
-
-    // 3. Compute public key from private key
-    // 3a. Hash private key and clamp bits
+    // https://docs.rs/ed25519-dalek/2.1.1/src/ed25519_dalek/signing.rs.html#102-108
+    u32 in[32] = { 0 };
     uchar hash[64];
-    blake2b_state state;
-    blake2b_init(&state, 64);
-    blake2b_update(&state, key, 32);
-    blake2b_final(&state, hash, 64);
-    hash[0] &= 0xF8; // Clear bits 0-2
-    hash[31] &= 0x7F; // Clear bit 255
+
+    sha512_ctx_t keystate;
+    sha512_init(&keystate);
+    to_32bytes_sha2_input(in, key);
+    sha512_update(&keystate, in, 32);
+    sha512_final(&keystate);
+    from_sha512_result(hash, keystate.h);
+
+    hash[0] &= 248; // Clear bits 0-2
+    hash[31] &= 127; // Clear bit 255
     hash[31] |= 0x40; // Set bit 254
 
     // 3b. Scalar multiplication
