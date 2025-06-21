@@ -1,0 +1,4 @@
+/target
+/perf.*
+/flamegraph.*
+/Cargo.lock
