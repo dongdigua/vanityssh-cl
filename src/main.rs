@@ -25,7 +25,7 @@ use std::cmp;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const KERNEL_NAME: &str = "generate_ed25519_key";
-const BATCH_SIZE: usize = 2;
+const BATCH_SIZE: usize = 65536;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
 #[repr(usize)]
@@ -77,13 +77,9 @@ fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
 }
 
 fn main() -> Result<()> {
+    let mut rng = rand::rng();
     let (context, queue, kernel) = init_cl()?;
     println!("opencl initialized");
-
-    // feed data
-    // let mut rng = rand::rng();
-    // let prng_constants: [cl_ulong; 4] = [rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>()];
-    let prng_constants = [1u8; ARRAY_SIZE];
 
     let out0 = unsafe {
         Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
@@ -91,15 +87,19 @@ fn main() -> Result<()> {
     let out1 = unsafe {
         Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
-    let mut prngs = unsafe {
-        Buffer::<cl_uchar>::create(&context, CL_MEM_WRITE_ONLY, ARRAY_SIZE, ptr::null_mut())?
-    };
-    let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
 
     // let mut start_index = 0u64;
-    // let mut tries = 0;
+    let mut tries = 0;
     let now = std::time::Instant::now();
-    for _ in 1..2 {
+    loop {
+
+        let mut prng_constants = [0u8; ARRAY_SIZE];
+        rng.fill(&mut prng_constants[..]);
+        let mut prngs = unsafe {
+            Buffer::<cl_uchar>::create(&context, CL_MEM_WRITE_ONLY, ARRAY_SIZE, ptr::null_mut())?
+        };
+        let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
+
         let kernel_event = unsafe {
             ExecuteKernel::new(&kernel)
                 .set_arg(&out0)
@@ -126,28 +126,44 @@ fn main() -> Result<()> {
         read_event0.wait()?;
         read_event1.wait()?;
 
-        println!("{:?}", results0);
-        println!("{:?}", results1);
+        // println!("{:?}", results0);
+        // println!("{:?}", results1);
 
-        // let found = results.par_chunks_exact(SECRET_KEY_LENGTH)
-        //     .map(|chunk| SigningKey::from_bytes(chunk.try_into().unwrap()))
-        //     .find_any(|sk| process_key(sk, re.clone()));
+        let found = results1.par_chunks_exact(SECRET_KEY_LENGTH)
+            .position(|pk| find_key(pk));
 
-        // if found != None { break; }
+        if let Some(pos) = found {
+            let sk = results0[pos];
+            println!("{:?}", sk);
+            break;
+        }
 
         // start_index += ARRAY_SIZE as u64;
-        // tries += 1
+        tries += 1
     }
 
     let elapsed = match now.elapsed().as_secs() {
         0 => 1,
         n => n,
     };
-    // println!("secs: {}", elapsed);
-    // println!("tries: {}", tries * BATCH_SIZE);
-    // println!("Key/s: {}", tries * BATCH_SIZE / elapsed as usize);
+    println!("secs: {}", elapsed);
+    println!("tries: {}", tries * BATCH_SIZE);
+    println!("Key/s: {}", tries * BATCH_SIZE / elapsed as usize);
 
     Ok(())
+}
+
+fn find_key(pk_bytes: &[u8]) -> bool {
+    let re = Regex::new("(?i)rick").unwrap();
+    let pk: PublicKey = Ed25519PublicKey::try_from(pk_bytes).unwrap().into();
+    let fp = pk.fingerprint(Default::default()).to_string();
+    if re.is_match(&fp) {
+        println!("{}", pk.to_openssh().unwrap());
+        println!("{}", fp);
+        true
+    } else {
+        false
+    }
 }
 
 fn process_key(sk: &SigningKey, re: Regex) -> bool {
