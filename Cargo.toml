@@ -12,3 +12,8 @@ rand = "0.9"
 rayon = "1.10"
 regex = "1.11"
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "alloc"] }
+nix = { version = "0.30", features = ["signal"] }
+
+[profile.release]
+opt-level = 3
+lto = true

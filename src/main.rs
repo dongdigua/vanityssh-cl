@@ -18,8 +18,11 @@ use ssh_key::private::Ed25519Keypair;
 use ssh_key::public::PublicKey;
 use ssh_key::public::Ed25519PublicKey;
 
+use nix::sys::signal::{self, Signal, SigHandler};
+
 use std::ptr;
 use std::cmp;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // PRNG by DeepSeek
 const PROGRAM_SOURCE: &str = r#"
@@ -55,12 +58,23 @@ const KERNEL_NAME: &str = "generate_seeds";
 const BATCH_SIZE: usize = 16384;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
+
+static RUN: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
+    RUN.store(false, Ordering::Relaxed);
+}
+
+// https://github.com/kenba/opencl3/blob/main/examples/basic.rs
 fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
     // Find a usable device for this application
     let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU)?
         .first()
         .expect("no device found in platform");
     let device = Device::new(device_id);
+
+    println!("CL_DEVICE_VENDOR: {}", device.vendor()?);
+    println!("CL_DEVICE_NAME: {}", device.name()?);
 
     // Create a Context on an OpenCL device
     let context = Context::from_device(&device).expect("Context::from_device failed");
@@ -82,7 +96,7 @@ fn parse_args() -> Option<Regex> {
 
     match args.len().cmp(&1) {
         cmp::Ordering::Equal => {
-            Some(Regex::new(r"test").unwrap(), )
+            Some(Regex::new(r"test").unwrap())
         }
         cmp::Ordering::Greater => {
             Some(Regex::new(args[1].as_str()).unwrap())
@@ -95,6 +109,8 @@ fn parse_args() -> Option<Regex> {
 
 fn main() -> Result<()> {
     let re = parse_args().unwrap();
+    let handler = SigHandler::Handler(handle_sigint);
+    unsafe { signal::signal(Signal::SIGINT, handler) }.unwrap();
     let (context, queue, kernel) = init_cl()?;
     println!("opencl initialized");
 
@@ -110,11 +126,10 @@ fn main() -> Result<()> {
     };
     let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
 
-
     let mut start_index = 0u64;
-    let mut tries = 0;
+    let mut tries = 1;
     let now = std::time::Instant::now();
-    loop {
+    while RUN.load(Ordering::SeqCst) {
         let kernel_event = unsafe {
             ExecuteKernel::new(&kernel)
                 .set_arg(&out)
