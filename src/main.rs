@@ -24,38 +24,8 @@ use std::ptr;
 use std::cmp;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// PRNG by DeepSeek
-const PROGRAM_SOURCE: &str = r#"
-kernel void generate_seeds(
-    global uchar* seeds,
-    ulong start_index,
-    global ulong* prng_constants
-) {
-    size_t gid = get_global_id(0);
-    ulong state = (gid + start_index) * prng_constants[0] + prng_constants[1];
-    ulong a = prng_constants[2];
-    ulong c = prng_constants[3];
-
-    __global uchar* seed = &seeds[gid * 32];
-
-    // PRNG
-    for (int i = 0; i < 8; i++) {
-        state = state * a + c;
-        // Split 64-bit state into 8 bytes
-        seed[i*4 + 0] = (state >> 0) & 0xFF;
-        seed[i*4 + 1] = (state >> 8) & 0xFF;
-        seed[i*4 + 2] = (state >> 16) & 0xFF;
-        seed[i*4 + 3] = (state >> 24) & 0xFF;
-        seed[i*4 + 4] = (state >> 32) & 0xFF;
-        seed[i*4 + 5] = (state >> 40) & 0xFF;
-        seed[i*4 + 6] = (state >> 48) & 0xFF;
-        seed[i*4 + 7] = (state >> 56) & 0xFF;
-    }
-}
-"#;
-
-const KERNEL_NAME: &str = "generate_seeds";
-const BATCH_SIZE: usize = 16384;
+const KERNEL_NAME: &str = "generate_ed25519_key";
+const BATCH_SIZE: usize = 2;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
 #[repr(usize)]
@@ -66,10 +36,6 @@ enum Mode {
 }
 static mut MODE_IDX: Mode = Mode::FingerPrint;
 static RUN: AtomicBool = AtomicBool::new(true);
-
-extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
-    RUN.store(false, Ordering::Relaxed);
-}
 
 // https://github.com/kenba/opencl3/blob/main/examples/basic.rs
 fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
@@ -90,64 +56,56 @@ fn init_cl() -> Result<(Context, CommandQueue, Kernel)> {
         .expect("CommandQueue::create_default failed");
 
     // Build the OpenCL program source and create the kernel.
-    let program = Program::create_and_build_from_source(&context, PROGRAM_SOURCE, "")
+    let sources = [
+        // include_str!("opencl/blake2b.cl"),
+        // include_str!("opencl/curve25519-constants.cl"),
+        // include_str!("opencl/curve25519-constants2.cl"),
+        // include_str!("opencl/curve25519.cl"),
+        // include_str!("opencl/entry.cl")
+        include_str!("opencl/merged")
+    ];
+
+    let program = Program::create_and_build_from_sources(&context, &sources, "")
         .expect("Program::create_and_build_from_source failed");
+
+    println!("aaa");
+
     let kernel = Kernel::create(&program, KERNEL_NAME).expect("Kernel::create failed");
+
 
     Ok((context, queue, kernel))
 }
 
-fn parse_args() -> Option<Regex> {
-    let args: Vec<String> = std::env::args().collect();
-
-    match args.len().cmp(&1) {
-        cmp::Ordering::Equal => {
-            Some(Regex::new(r"test").unwrap())
-        }
-        cmp::Ordering::Greater => {
-            if args.len() == 3 {
-                match args[2].as_str() {
-                    "-k" => unsafe {MODE_IDX = Mode::PubKey},
-                    _ => todo!("I don't know what you mean"),
-                }
-            }
-            Some(Regex::new(args[1].as_str()).unwrap())
-        }
-        cmp::Ordering::Less => {
-            None
-        }
-    }
-}
-
 fn main() -> Result<()> {
-    let re = parse_args().unwrap();
-    let handler = SigHandler::Handler(handle_sigint);
-    unsafe { signal::signal(Signal::SIGINT, handler) }.unwrap();
     let (context, queue, kernel) = init_cl()?;
     println!("opencl initialized");
 
     // feed data
-    let mut rng = rand::rng();
-    let prng_constants: [cl_ulong; 4] = [rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>()];
+    // let mut rng = rand::rng();
+    // let prng_constants: [cl_ulong; 4] = [rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>(), rng.random::<cl_ulong>()];
+    let prng_constants = [1u8; ARRAY_SIZE];
 
-    let out = unsafe {
-        Buffer::<cl_uchar>::create(&context, CL_MEM_WRITE_ONLY, ARRAY_SIZE, ptr::null_mut())?
+    let out0 = unsafe {
+        Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
+    };
+    let out1 = unsafe {
+        Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
     let mut prngs = unsafe {
-        Buffer::<cl_ulong>::create(&context, CL_MEM_READ_ONLY, 4, ptr::null_mut())?
+        Buffer::<cl_uchar>::create(&context, CL_MEM_WRITE_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
     let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
 
-    let mut start_index = 0u64;
-    let mut tries = 0;
+    // let mut start_index = 0u64;
+    // let mut tries = 0;
     let now = std::time::Instant::now();
-    while RUN.load(Ordering::Relaxed) {
+    for _ in 1..2 {
         let kernel_event = unsafe {
             ExecuteKernel::new(&kernel)
-                .set_arg(&out)
-                .set_arg(&start_index)
+                .set_arg(&out0)
+                .set_arg(&out1)
                 .set_arg(&prngs)
-                .set_global_work_size(ARRAY_SIZE)
+                .set_global_work_size(BATCH_SIZE)
                 .enqueue_nd_range(&queue)?
         };
 
@@ -156,30 +114,38 @@ fn main() -> Result<()> {
 
         // Create a results array to hold the results from the OpenCL device
         // and enqueue a read command to read the device buffer into the array
-        let mut results: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
-        let read_event =
-            unsafe { queue.enqueue_read_buffer(&out, CL_NON_BLOCKING, 0, &mut results, &events)? };
+        let mut results0: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
+        let read_event0 =
+            unsafe { queue.enqueue_read_buffer(&out0, CL_NON_BLOCKING, 0, &mut results0, &events)? };
+
+        let mut results1: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
+        let read_event1 =
+            unsafe { queue.enqueue_read_buffer(&out1, CL_NON_BLOCKING, 0, &mut results1, &events)? };
 
         // Wait for the read_event to complete.
-        read_event.wait()?;
+        read_event0.wait()?;
+        read_event1.wait()?;
 
-        let found = results.par_chunks_exact(SECRET_KEY_LENGTH)
-            .map(|chunk| SigningKey::from_bytes(chunk.try_into().unwrap()))
-            .find_any(|sk| process_key(sk, re.clone()));
+        println!("{:?}", results0);
+        println!("{:?}", results1);
 
-        if found != None { break; }
+        // let found = results.par_chunks_exact(SECRET_KEY_LENGTH)
+        //     .map(|chunk| SigningKey::from_bytes(chunk.try_into().unwrap()))
+        //     .find_any(|sk| process_key(sk, re.clone()));
 
-        start_index += ARRAY_SIZE as u64;
-        tries += 1
+        // if found != None { break; }
+
+        // start_index += ARRAY_SIZE as u64;
+        // tries += 1
     }
 
     let elapsed = match now.elapsed().as_secs() {
         0 => 1,
         n => n,
     };
-    println!("secs: {}", elapsed);
-    println!("tries: {}", tries * BATCH_SIZE);
-    println!("Key/s: {}", tries * BATCH_SIZE / elapsed as usize);
+    // println!("secs: {}", elapsed);
+    // println!("tries: {}", tries * BATCH_SIZE);
+    // println!("Key/s: {}", tries * BATCH_SIZE / elapsed as usize);
 
     Ok(())
 }
