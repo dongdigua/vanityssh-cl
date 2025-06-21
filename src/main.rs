@@ -58,7 +58,13 @@ const KERNEL_NAME: &str = "generate_seeds";
 const BATCH_SIZE: usize = 16384;
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
-
+#[repr(usize)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    PubKey = 0,
+    FingerPrint = 1,
+}
+static mut MODE_IDX: Mode = Mode::FingerPrint;
 static RUN: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
@@ -99,6 +105,12 @@ fn parse_args() -> Option<Regex> {
             Some(Regex::new(r"test").unwrap())
         }
         cmp::Ordering::Greater => {
+            if args.len() == 3 {
+                match args[2].as_str() {
+                    "-k" => unsafe {MODE_IDX = Mode::PubKey},
+                    _ => todo!("I don't know what you mean"),
+                }
+            }
             Some(Regex::new(args[1].as_str()).unwrap())
         }
         cmp::Ordering::Less => {
@@ -127,9 +139,9 @@ fn main() -> Result<()> {
     let _prngs_write_event = unsafe { queue.enqueue_write_buffer(&mut prngs, CL_BLOCKING, 0, &prng_constants, &[])? };
 
     let mut start_index = 0u64;
-    let mut tries = 1;
+    let mut tries = 0;
     let now = std::time::Instant::now();
-    while RUN.load(Ordering::SeqCst) {
+    while RUN.load(Ordering::Relaxed) {
         let kernel_event = unsafe {
             ExecuteKernel::new(&kernel)
                 .set_arg(&out)
@@ -173,10 +185,13 @@ fn main() -> Result<()> {
 }
 
 fn process_key(sk: &SigningKey, re: Regex) -> bool {
-    let (pk, fp) = to_ssh_ed25519_public_key(sk.verifying_key().as_bytes());
-    if re.is_match(&fp) {
-        println!("{}", pk);
-        println!("{}", fp);
+    let v = to_ssh_ed25519_public_key(sk.verifying_key().as_bytes());
+    let to_match = unsafe {&v[MODE_IDX as usize]}.as_ref().unwrap();
+    if re.is_match(&to_match) {
+        println!("{}", &to_match);
+        if unsafe{MODE_IDX == Mode::FingerPrint} {
+            println!("{}", &v[Mode::PubKey as usize].as_ref().unwrap());
+        }
         println!("{}", to_ssh_ed25519_private_key(sk));
         true
     } else {
@@ -184,19 +199,20 @@ fn process_key(sk: &SigningKey, re: Regex) -> bool {
     }
 }
 
-fn to_ssh_ed25519_public_key(public_key: &[u8; 32]) -> (String, String) {
+fn to_ssh_ed25519_public_key(public_key: &[u8; 32]) -> [Option<String>; 2] {
     let pk = PublicKey::from(Ed25519PublicKey(*public_key));
-    (pk.to_openssh().unwrap(), pk.fingerprint(Default::default()).to_string())
+    [Some(pk.to_openssh().unwrap()),
+     if unsafe{MODE_IDX == Mode::FingerPrint} {
+         Some(pk.fingerprint(Default::default()).to_string())
+     } else {None}]
 }
 
 fn to_ssh_ed25519_private_key(sk: &SigningKey) -> String {
-    let private = sk;                         // [u8;32]
-    let public = sk.verifying_key();         // [u8;32]
+    let private = sk;
+    let public = sk.verifying_key();
 
-    // 2) build an Ed25519 keypair
     let ed_kp = Ed25519Keypair { public: public.into(), private: private.into() };
-
-    // 3) wrap in a PrivateKey and serialize as OpenSSH
     let pkey = PrivateKey::from(ed_kp);
+
     pkey.to_openssh(ssh_key::LineEnding::default()).unwrap().to_string()
 }
