@@ -1,0 +1,18 @@
+#+TITLE: vanityssh-cl
+
+it utilizes OpenCL for generating ed25519 ssh keys
+
+3~4x speed of CPU-based (on my machine)
+
+** is it safe?
+¯\_(ツ)_/¯
+
+** background
+see https://github.com/dongdigua/rickroll-ssh/tree/main/ssh
+
+** credits
+- https://github.com/webmaster128/lisk-vanity OpenCL ed25519 key generation
+
+** btw
+[[https://crates.io/crates/ocl][ocl]] is obsolete, don't use it today.
+It has caused me a lot of pain when building projects that depend on it

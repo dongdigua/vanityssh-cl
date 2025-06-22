@@ -25,7 +25,7 @@ use std::cmp;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const KERNEL_NAME: &str = "generate_ed25519_key";
-const BATCH_SIZE: usize = 65536;
+const BATCH_SIZE: usize = 65536; // 1048576 will stack overflow on my machine, so just be safe
 const ARRAY_SIZE: usize = SECRET_KEY_LENGTH * BATCH_SIZE;
 
 #[repr(usize)]
@@ -83,7 +83,8 @@ fn parse_args() -> Option<Regex> {
 
     match args.len().cmp(&1) {
         cmp::Ordering::Equal => {
-            Some(Regex::new(r"test").unwrap())
+            println!("vanityssh-cl <regex>");
+            None
         }
         cmp::Ordering::Greater => {
             if args.len() == 3 {
@@ -107,16 +108,15 @@ fn main() -> Result<()> {
     unsafe { signal::signal(Signal::SIGINT, handler) }.unwrap();
 
     let (context, queue, kernel) = init_cl()?;
-    println!("opencl initialized");
+    println!("OpenCL initialized");
 
-    let out0 = unsafe {
+    let out_s = unsafe {
         Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
-    let out1 = unsafe {
+    let out_p = unsafe {
         Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, ARRAY_SIZE, ptr::null_mut())?
     };
 
-    // let mut start_index = 0u64;
     let mut tries = 0;
     let now = std::time::Instant::now();
     while RUN.load(Ordering::Relaxed)  {
@@ -130,8 +130,8 @@ fn main() -> Result<()> {
 
         let kernel_event = unsafe {
             ExecuteKernel::new(&kernel)
-                .set_arg(&out0)
-                .set_arg(&out1)
+                .set_arg(&out_s)
+                .set_arg(&out_p)
                 .set_arg(&prngs)
                 .set_global_work_size(BATCH_SIZE)
                 .enqueue_nd_range(&queue)?
@@ -142,31 +142,27 @@ fn main() -> Result<()> {
 
         // Create a results array to hold the results from the OpenCL device
         // and enqueue a read command to read the device buffer into the array
-        let mut results0: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
+        let mut results_s: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
         let read_event0 =
-            unsafe { queue.enqueue_read_buffer(&out0, CL_NON_BLOCKING, 0, &mut results0, &events)? };
+            unsafe { queue.enqueue_read_buffer(&out_s, CL_NON_BLOCKING, 0, &mut results_s, &events)? };
 
-        let mut results1: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
+        let mut results_p: [cl_uchar; ARRAY_SIZE] = [0; ARRAY_SIZE];
         let read_event1 =
-            unsafe { queue.enqueue_read_buffer(&out1, CL_NON_BLOCKING, 0, &mut results1, &events)? };
+            unsafe { queue.enqueue_read_buffer(&out_p, CL_NON_BLOCKING, 0, &mut results_p, &events)? };
 
         // Wait for the read_event to complete.
         read_event0.wait()?;
         read_event1.wait()?;
 
-        // println!("{:?}", results0);
-        // println!("{:?}", results1);
-
-        let found = results1.par_chunks_exact(SECRET_KEY_LENGTH)
+        let found = results_p.par_chunks_exact(SECRET_KEY_LENGTH)
             .position_any(|pk| find_key(pk, &re));
 
         if let Some(pos) = found {
-            let sk_bytes = results0.chunks_exact(SECRET_KEY_LENGTH).nth(pos).unwrap();
+            let sk_bytes = results_s.chunks_exact(SECRET_KEY_LENGTH).nth(pos).unwrap();
             to_ssh_ed25519_private_key(sk_bytes.try_into().unwrap());
             break;
         }
 
-        // start_index += ARRAY_SIZE as u64;
         tries += 1
     }
 
